@@ -4,7 +4,7 @@ import argparse
 import time
 import shutil
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '1'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 import os.path as osp
 import csv
 import numpy as np
@@ -20,7 +20,7 @@ from data import NTUDataLoaders, AverageMeter
 import fit
 from util import make_dir, get_num_classes
 
-parser = argparse.ArgumentParser(description='Skeleton-Based Action Recgnition')
+parser = argparse.ArgumentParser(description='Skeleton-Based Action Recognition')
 fit.add_fit_args(parser)
 parser.set_defaults(
     network='SGN',
@@ -59,12 +59,12 @@ def main():
     if args.monitor == 'val_acc':
         mode = 'max'
         monitor_op = np.greater
-        best = -np.Inf
+        best = -np.inf
         str_op = 'improve'
     elif args.monitor == 'val_loss':
         mode = 'min'
         monitor_op = np.less
-        best = np.Inf
+        best = np.inf
         str_op = 'reduce'
 
     scheduler = MultiStepLR(optimizer, milestones=[60, 90, 110], gamma=0.1)
@@ -102,14 +102,24 @@ def main():
             print(epoch, optimizer.param_groups[0]['lr'])
 
             t_start = time.time()
-            train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch)
-            val_loss, val_acc = validate(val_loader, model, criterion)
-            log_res += [[train_loss, train_acc.cpu().numpy(),\
-                         val_loss, val_acc.cpu().numpy()]]
+            
+            if args.dataset == 'NTU_SRID':
+                train_loss, train_acc, train_acc_5 = train_topk(train_loader, model, criterion, optimizer, epoch)
+                val_loss, val_acc, val_acc_5 = validate_top5(val_loader, model, criterion)
+                log_res += [[train_loss, train_acc.cpu().numpy(), train_acc_5.cpu().numpy(),\
+                         val_loss, val_acc.cpu().numpy(), val_acc_5.cpu().numpy()]]
+                print('Epoch-{:<3d} {:.1f}s\t'
+                  'Train: loss {:.4f}\ttop-1 accu {:.4f}\ttop-5 accu {:.4f}\tValid: loss {:.4f}\ttop-1 accu {:.4f}\ttop-5 accu {:.4f}'
+                  .format(epoch + 1, time.time() - t_start, train_loss, train_acc, train_acc_5, val_loss, val_acc, val_acc_5))
 
-            print('Epoch-{:<3d} {:.1f}s\t'
-                  'Train: loss {:.4f}\taccu {:.4f}\tValid: loss {:.4f}\taccu {:.4f}'
-                  .format(epoch + 1, time.time() - t_start, train_loss, train_acc, val_loss, val_acc))
+            else:
+                train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch)
+                val_loss, val_acc = validate(val_loader, model, criterion)
+                log_res += [[train_loss, train_acc.cpu().numpy(),\
+                         val_loss, val_acc.cpu().numpy()]]
+                print('Epoch-{:<3d} {:.1f}s\t'
+                    'Train: loss {:.4f}\taccu {:.4f}\tValid: loss {:.4f}\taccu {:.4f}'
+                    .format(epoch + 1, time.time() - t_start, train_loss, train_acc, val_loss, val_acc))
 
             current = val_loss if mode == 'min' else val_acc
 
@@ -139,7 +149,10 @@ def main():
         print('Best %s: %.4f from epoch-%d' % (args.monitor, best, best_epoch))
         with open(csv_file, 'w') as fw:
             cw = csv.writer(fw)
-            cw.writerow(['loss', 'acc', 'val_loss', 'val_acc'])
+            if args.dataset == 'NTU_SRID':
+                cw.writerow(['loss', 'acc', 'acc_5', 'val_loss', 'val_acc', 'val_acc_5'])
+            else:
+                cw.writerow(['loss', 'acc', 'val_loss', 'val_acc'])
             cw.writerows(log_res)
         print('Save train and validation log into into %s' % csv_file)
 
@@ -147,8 +160,42 @@ def main():
     args.train = 0
     model = SGN(args.num_classes, args.dataset, args.seg, args)
     model = model.cuda()
-    test(test_loader, model, checkpoint, lable_path, pred_path)
+    if args.dataset == 'NTU_SRID':
+        test_top5(test_loader, model, checkpoint, lable_path, pred_path)
+    else:
+        test(test_loader, model, checkpoint, lable_path, pred_path)
 
+def train_topk(train_loader, model, criterion, optimizer, epoch):
+    losses = AverageMeter()
+    acces_top1 = AverageMeter()
+    acces_top5 = AverageMeter()
+    model.train()
+
+    for i, (inputs, target) in enumerate(train_loader):
+
+        output = model(inputs.cuda())
+        target = target.cuda(non_blocking = True)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        accs = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.item(), inputs.size(0))
+        acces_top1.update(accs[0][0], inputs.size(0))
+        acces_top5.update(accs[1][0], inputs.size(0))
+
+        # backward
+        optimizer.zero_grad()  # clear gradients out before each mini-batch
+        loss.backward()
+        optimizer.step()
+
+        if (i + 1) % args.print_freq == 0:
+            print('Epoch-{:<3d} {:3d} batches\t'
+                  'loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'top-1 accu {acc.val:.3f} ({acc.avg:.3f})\t'
+                  'top-5 accu {acc_top5.val:.3f} ({acc_top5.avg:.3f})'.format(
+                   epoch + 1, i + 1, loss=losses, acc=acces_top1, acc_top5=acces_top5))
+
+    return losses.avg, acces_top1.avg, acces_top5.avg
 
 def train(train_loader, model, criterion, optimizer, epoch):
     losses = AverageMeter()
@@ -158,13 +205,13 @@ def train(train_loader, model, criterion, optimizer, epoch):
     for i, (inputs, target) in enumerate(train_loader):
 
         output = model(inputs.cuda())
-        target = target.cuda(async = True)
+        target = target.cuda(non_blocking = True)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
         acc = accuracy(output.data, target)
         losses.update(loss.item(), inputs.size(0))
-        acces.update(acc[0], inputs.size(0))
+        acces.update(acc[0][0], inputs.size(0))
 
         # backward
         optimizer.zero_grad()  # clear gradients out before each mini-batch
@@ -179,6 +226,28 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     return losses.avg, acces.avg
 
+def validate_top5(val_loader, model, criterion):
+    losses = AverageMeter()
+    acces_top1 = AverageMeter()
+    acces_top5 = AverageMeter()
+
+    model.eval()
+
+    for i, (inputs, target) in enumerate(val_loader):
+        with torch.no_grad():
+            output = model(inputs.cuda())
+        target = target.cuda(non_blocking=True)
+        with torch.no_grad():
+            loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        accs = accuracy(output.data, target, topk=(1, 5))
+        losses.update(loss.item(), inputs.size(0))
+        acces_top1.update(accs[0][0], inputs.size(0))
+        acces_top5.update(accs[1][0], inputs.size(0))
+
+    return losses.avg, acces_top1.avg, acces_top5.avg
+
 
 def validate(val_loader, model, criterion):
     losses = AverageMeter()
@@ -188,17 +257,51 @@ def validate(val_loader, model, criterion):
     for i, (inputs, target) in enumerate(val_loader):
         with torch.no_grad():
             output = model(inputs.cuda())
-        target = target.cuda(async=True)
+        target = target.cuda(non_blocking=True)
         with torch.no_grad():
             loss = criterion(output, target)
 
         # measure accuracy and record loss
         acc = accuracy(output.data, target)
         losses.update(loss.item(), inputs.size(0))
-        acces.update(acc[0], inputs.size(0))
+        acces.update(acc[0][0], inputs.size(0))
 
     return losses.avg, acces.avg
 
+def test_top5(test_loader, model, checkpoint, lable_path, pred_path):
+    acces_top1 = AverageMeter()
+    acces_top5 = AverageMeter()
+    # load learnt model that obtained best performance on validation set
+    model.load_state_dict(torch.load(checkpoint)['state_dict'])
+    model.eval()
+
+    label_output = list()
+    pred_output = list()
+
+    t_start = time.time()
+    for i, (inputs, target) in enumerate(test_loader):
+        with torch.no_grad():
+            output = model(inputs.cuda())
+            output = output.view((-1, inputs.size(0)//target.size(0), output.size(1)))
+            output = output.mean(1)
+
+        label_output.append(target.cpu().numpy())
+        pred_output.append(output.cpu().numpy())
+
+        accs = accuracy(output.data, target.cuda(non_blocking=True), topk=(1, 5))
+        #acces.update(acc[0], inputs.size(0))
+        acces_top1.update(accs[0][0], inputs.size(0))
+        acces_top5.update(accs[1][0], inputs.size(0))
+
+
+    label_output = np.concatenate(label_output, axis=0)
+    np.savetxt(lable_path, label_output, fmt='%d')
+    pred_output = np.concatenate(pred_output, axis=0)
+    np.savetxt(pred_path, pred_output, fmt='%f')
+
+    print('Test: top-1 accuracy {:.3f}, top-5 accuracy {:.3f} time: {:.2f}s'
+          .format(acces_top1.avg, acces_top5.avg, time.time() - t_start))
+    
 
 def test(test_loader, model, checkpoint, lable_path, pred_path):
     acces = AverageMeter()
@@ -219,8 +322,8 @@ def test(test_loader, model, checkpoint, lable_path, pred_path):
         label_output.append(target.cpu().numpy())
         pred_output.append(output.cpu().numpy())
 
-        acc = accuracy(output.data, target.cuda(async=True))
-        acces.update(acc[0], inputs.size(0))
+        acc = accuracy(output.data, target.cuda(non_blocking=True))
+        acces.update(acc[0][0], inputs.size(0))
 
 
     label_output = np.concatenate(label_output, axis=0)
@@ -232,14 +335,24 @@ def test(test_loader, model, checkpoint, lable_path, pred_path):
           .format(acces.avg, time.time() - t_start))
 
 
-def accuracy(output, target):
+def accuracy(output, target, topk=(1,)):
+    maxk = max(topk)
     batch_size = target.size(0)
-    _, pred = output.topk(1, 1, True, True)
+    _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-    correct = correct.view(-1).float().sum(0, keepdim=True)
+    correct = (pred == target.view(1, -1).expand_as(pred))
 
-    return correct.mul_(100.0 / batch_size)
+    list_topk_accs = []
+    for k in topk:
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+        list_topk_accs.append(correct_k.mul_(100.0 / batch_size))
+
+    return list_topk_accs
+
+    #correct = pred.eq(target.view(1, -1).expand_as(pred))
+    #correct = correct.view(-1).float().sum(0, keepdim=True)
+
+    #return correct.mul_(100.0 / batch_size)
 
 def save_checkpoint(state, filename='checkpoint.pth.tar', is_best=False):
     torch.save(state, filename)

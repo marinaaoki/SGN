@@ -83,15 +83,50 @@ class NTUDataLoaders(object):
             elif self.case == 1:
                 self.metric = 'CV'
             path = osp.join('./data/ntu', 'NTU_' + self.metric + '.h5')
+        elif self.dataset == 'NTU_SRID':
+            path = osp.join('./data/ntu', 'NTU_SRID_CV.h5')
 
-        f = h5py.File(path , 'r')
-        self.train_X = f['x'][:]
-        self.train_Y = np.argmax(f['y'][:],-1)
-        self.val_X = f['valid_x'][:]
-        self.val_Y = np.argmax(f['valid_y'][:], -1)
-        self.test_X = f['test_x'][:]
-        self.test_Y = np.argmax(f['test_y'][:], -1)
-        f.close()
+        if self.dataset.startswith('SITC'):
+            path = osp.join('./data/sitc', 'SITC_TC2-1.h5')
+            f = h5py.File(path , 'r')
+            fold = 3
+            self.train_X = f[f'f{fold}']['train']['x'][:]
+            self.val_X = f[f'f{fold}']['val']['x'][:]
+            self.test_X = f['test']['x'][:]
+            if self.case == 0: # SAR
+                self.train_Y = np.argmax(f[f'f{fold}']['train']['a'][:],-1)
+                self.val_Y = np.argmax(f[f'f{fold}']['val']['a'][:],-1)
+                self.test_Y = np.argmax(f['test']['a'][:],-1)
+            elif self.case == 1: # SRID
+                self.train_Y = np.argmax(f[f'f{fold}']['train']['p'][:],-1)
+                self.val_Y = np.argmax(f[f'f{fold}']['val']['p'][:],-1)
+                self.test_Y = np.argmax(f['test']['p'][:],-1)
+            f.close()
+            #return
+        elif self.dataset.startswith('PP'):
+            # privacy-preserving case, so we initialise "empty" train and val sets and load only the test set to perform inference
+            path = osp.join('./data/sitc', 'PP-SITC_TC2-1_onlyTest.h5')
+            f = h5py.File(path , 'r')
+            self.train_X = np.zeros((80, 25, 3))
+            self.train_Y = np.zeros((80, 25))
+            self.val_X = np.zeros((80, 25, 3))
+            self.val_Y = np.zeros((80, 25))
+
+            self.test_X = f['test']['x'][:]
+            if self.case == 0:
+                self.test_Y = np.argmax(f['test']['a'][:], -1)
+            elif self.case == 1:
+                self.test_Y = np.argmax(f['test']['p'][:], -1)
+            f.close()
+        else:
+            f = h5py.File(path , 'r')
+            self.train_X = f['x'][:]
+            self.train_Y = np.argmax(f['y'][:],-1)
+            self.val_X = f['valid_x'][:]
+            self.val_Y = np.argmax(f['valid_y'][:], -1)
+            self.test_X = f['test_x'][:]
+            self.test_Y = np.argmax(f['test_y'][:], -1)
+            f.close()
 
         ## Combine the training data and validation data togehter as ST-GCN
         self.train_X = np.concatenate([self.train_X, self.val_X], axis=0)
@@ -111,7 +146,7 @@ class NTUDataLoaders(object):
             x = list(x)
 
         x, y = self.Tolist_fix(x, y, train=1)
-        lens = np.array([x_.shape[0] for x_ in x], dtype=np.int)
+        lens = np.array([x_.shape[0] for x_ in x], dtype=int)
         idx = lens.argsort()[::-1]  # sort sequence by valid length in descending order
         y = np.array(y)[idx]
         x = torch.stack([torch.from_numpy(x[i]) for i in idx], 0)
@@ -123,6 +158,8 @@ class NTUDataLoaders(object):
                 theta = 0.5
         elif self.dataset == 'NTU120':
             theta = 0.3
+        else:
+            theta = 0.5
 
         #### data augmentation
         x = _transform(x, theta)
@@ -164,12 +201,17 @@ class NTUDataLoaders(object):
         for idx, seq in enumerate(joints):
             zero_row = []
             for i in range(len(seq)):
-                if (seq[i, :] == np.zeros((1, 150))).all():
-                        zero_row.append(i)
+                if self.dataset.startswith('NTU'):
+                    if (seq[i, :] == np.zeros((1, 150))).all():
+                            zero_row.append(i)
+                else:
+                    if (seq[i, :] == np.zeros((1, 75))).all():
+                            zero_row.append(i)
 
             seq = np.delete(seq, zero_row, axis = 0)
 
-            seq = turn_two_to_one(seq)
+            if self.dataset.startswith('NTU'):
+                seq = turn_two_to_one(seq)
             seqs = self.sub_seq(seqs, seq, train=train)
 
         return seqs, y
